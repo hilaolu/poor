@@ -50,7 +50,7 @@ test("real Pi loader activates only bash_exec and apply_patch by default", async
   assert.match(definition.description, /\nSafety:/);
   assert.ok(definition.description.length < 1500);
   const shell = session.extensionRunner.getToolDefinition("bash_exec")!;
-  assert.ok(shell.description.length < 650);
+  assert.ok(shell.description.length < 1200);
   for (const field of ["exit_code", "signal", "timed_out", "descendant_cleanup_attempted", "preview", "len", "path"]) {
     assert.ok(shell.description.includes(field), field);
   }

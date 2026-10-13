@@ -1,9 +1,11 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { stripVTControlCharacters } from "node:util";
+import { truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { applyPatch, PatchFailure } from "./apply-patch.ts";
 import { LIMITS } from "./patch.ts";
 import { BASH_SNIPPET, PATCH_SNIPPET, buildPoorSystemPrompt, SHADOWED_TOOLS } from "./prompt.ts";
-import { BashRunner, bashParameters, type BashExecResult } from "./bash-exec.ts";
+import { BashRunner, bashParameters, type BashExecResult, type BackgroundResult } from "./bash-exec.ts";
 
 export { SHADOWED_TOOLS } from "./prompt.ts";
 
@@ -44,6 +46,23 @@ function commandPreview(command: unknown, limit = 120): string {
 
 export default function poor(pi: ExtensionAPI): void {
   const shell = new BashRunner();
+  let widgetContext: ExtensionContext | undefined;
+  const refreshBackgroundWidget = (ctx = widgetContext) => {
+    widgetContext = ctx;
+    if (!ctx?.hasUI) return;
+    const jobs = shell.activeBackgroundJobs();
+    if (!jobs.length) { ctx.ui.setWidget("poor-background", undefined); return; }
+    // Summarize once per lifecycle update, not on every terminal repaint.
+    const lines = jobs.map((job) =>
+      `${job.background_id} · ${job.pid} · ${commandPreview(stripVTControlCharacters(job.command))}`);
+    ctx.ui.setWidget("poor-background", (_tui, theme) => ({
+      render(width) {
+        if (width <= 0) return [];
+        return lines.map((line) => theme.fg("muted", truncateToWidth(line, width, width <= 3 ? "" : "...")));
+      },
+      invalidate() {},
+    }), { placement: "aboveEditor" });
+  };
   pi.registerTool({
     name: "bash_exec",
     label: "Bash Exec",
@@ -51,27 +70,42 @@ export default function poor(pi: ExtensionAPI): void {
       + "Result: { cwd, outcome }. Check outcome.exit_code, signal, timed_out, and descendant_cleanup_attempted. "
       + "outcome.stdout/stderr are null or { preview, len, path? }; len counts shown/observed bytes, path locates retained output. "
       + "Output beyond max_artifact_bytes is discarded; artifacts expire.\n"
-      + "Safety: no background services. Timeout, cancellation, or leftover descendants trigger cleanup, not filesystem rollback.",
+      + "Background: command + background_id launches a named job; background_id alone checks status; add kill:true to SIGKILL its process group. "
+      + "Returns { background_id, pid, exit, stdout_path, stderr_path }; exit is null while running, otherwise a code string or signal name. "
+      + "Completion automatically notifies the agent. Read logs using shell commands; stdin stays closed. IDs cannot be reused. "
+      + "Timeout (default 120s), shutdown, or leftover descendants trigger cleanup, not filesystem rollback.",
     promptSnippet: BASH_SNIPPET,
     parameters: bashParameters,
     async execute(_id, params, signal, _onUpdate, ctx) {
-      const result = await shell.run(ctx.cwd, params, signal);
+      widgetContext = ctx;
+      const result = await shell.execute(ctx.cwd, params, signal, (completed) => {
+        refreshBackgroundWidget();
+        pi.sendMessage({ customType: "poor-background", content: JSON.stringify(completed), display: true, details: completed },
+          { triggerTurn: true, deliverAs: "steer" });
+      });
+      if ("background_id" in result) refreshBackgroundWidget();
       // A single bounded response, not repeated streaming snapshots of a log.
       return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
     },
     renderCall(params) {
-      return oneLine(`$ ${commandPreview(params.command)}`);
+      return oneLine(params.command === undefined && params.background_id ? `${params.background_id}${params.kill ? " (kill)" : " (status)"}`
+        : `$ ${commandPreview(params.command)}${params.background_id ? ` [${params.background_id}]` : ""}`);
     },
     // Keep the TUI compact. Complete JSON remains model-visible and in the
     // session; users can inspect retained output through its artifact path.
     renderResult(result) {
-      const details = result.details as BashExecResult | undefined;
-      if (details?.outcome) return oneLine(bashStatus(details));
+      const details = result.details as BashExecResult | BackgroundResult | undefined;
+      if (details && "outcome" in details) return oneLine(bashStatus(details));
+      if (details && "background_id" in details) return oneLine(`${details.background_id}: ${details.exit === null ? `running (pid ${details.pid})` : `exit ${details.exit}`}`);
       const text = result.content.find((item) => item.type === "text")?.text ?? "bash_exec failed";
       return oneLine(text.split("\n", 1)[0]);
     },
   });
-  pi.on("session_shutdown", async () => { await shell.close(); });
+  pi.on("session_shutdown", async () => {
+    await shell.close();
+    refreshBackgroundWidget();
+    widgetContext = undefined;
+  });
   // Real overrides: even accidental reactivation cannot reach the originals.
   for (const name of SHADOWED_TOOLS) {
     const reason = disabledReason(name);
@@ -137,7 +171,7 @@ export default function poor(pi: ExtensionAPI): void {
     if (next.length !== active.length || next.some((name, i) => name !== active[i])) pi.setActiveTools(next);
   };
 
-  pi.on("session_start", async () => { hideOriginals(true); });
+  pi.on("session_start", async (_event, ctx) => { hideOriginals(true); refreshBackgroundWidget(ctx); });
   pi.on("session_tree", async () => { hideOriginals(); });
   pi.on("turn_start", async () => { hideOriginals(); });
   let warnedCustomPrompt = false;

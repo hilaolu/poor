@@ -26,8 +26,11 @@ const utf8String = (maxBytes: number, description: string) => Type.Unsafe<string
   type: "string", minLength: 1, description, "x-maxUtf8Bytes": maxBytes,
 });
 export const bashParameters = Type.Object({
-  command: utf8String(BASH_LIMITS.maxCommandBytes,
-    "Command passed to a fresh non-interactive bash -c; maximum 131072 UTF-8 bytes."),
+  command: Type.Optional(utf8String(BASH_LIMITS.maxCommandBytes,
+    "Command passed to a fresh non-interactive bash -c; omit to inspect/kill background_id; maximum 131072 UTF-8 bytes.")),
+  background_id: Type.Optional(Type.String({ minLength: 1, maxLength: 64, pattern: "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+    description: "Unique runner-scoped name. With command: launch background job; without command: status." })),
+  kill: Type.Optional(Type.Boolean({ description: "With background_id and no command: SIGKILL the owned process group and await cleanup." })),
   cwd: Type.Optional(Type.Unsafe<string>({ type: "string", minLength: 1, default: ".",
     description: "Working directory on the host; defaults to the session cwd. Relative cwd resolves from the session cwd. Maximum 4096 UTF-8 bytes.",
     "x-maxUtf8Bytes": 4096 })),
@@ -49,6 +52,26 @@ export interface OutputStream {
   preview: string;
   /** Bytes shown inline / bytes observed on the stream. */
   len: string;
+}
+
+export interface BackgroundResult {
+  background_id: string;
+  pid: number;
+  exit: string | null;
+  stdout_path: string;
+  stderr_path: string;
+  error?: string;
+}
+export type BashToolArguments = Partial<BashExecArguments> & { background_id?: string; kill?: boolean };
+interface BackgroundHooks {
+  started(result: Omit<BackgroundResult, "background_id">, kill: () => void): void;
+}
+interface BackgroundJob {
+  command: string;
+  ready: Promise<void>;
+  done: Promise<void>;
+  result?: BackgroundResult;
+  kill?: () => void;
 }
 export interface BashExecResult {
   cwd: string;
@@ -180,6 +203,7 @@ class Capture {
 /** One command per POSIX process group, independent captures for concurrent calls. */
 export class BashRunner {
   private active = new Map<AbortController, Promise<BashExecResult>>();
+  private jobs = new Map<string, BackgroundJob>();
   private closing?: Promise<void>;
   readonly artifacts: CommandArtifacts;
   private shell: string;
@@ -187,13 +211,67 @@ export class BashRunner {
     this.artifacts = artifacts; this.shell = shell;
   }
 
-  run(root: string, input: BashExecArguments, signal?: AbortSignal): Promise<BashExecResult> {
+  activeBackgroundJobs(): Array<{ background_id: string; pid: number; command: string }> {
+    return [...this.jobs.values()].flatMap((job) => job.result?.exit === null
+      ? [{ background_id: job.result.background_id, pid: job.result.pid, command: job.command }] : []);
+  }
+
+  async execute(root: string, input: BashToolArguments, signal?: AbortSignal,
+    completed?: (result: BackgroundResult) => void): Promise<BashExecResult | BackgroundResult> {
+    if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("bash_exec requires an argument object");
+    const { background_id: id, kill, ...launch } = input;
+    if (id === undefined) {
+      if (kill !== undefined) throw new Error("kill requires background_id");
+      return this.run(root, launch as BashExecArguments, signal);
+    }
+    if (typeof id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(id)) throw new Error("Invalid background_id (use 1-64 letters, digits, _, . or -; start with a letter/digit)");
+    if (kill !== undefined && typeof kill !== "boolean") throw new Error("kill must be boolean");
+    signal?.throwIfAborted();
+    if (this.closing) throw new Error("bash_exec runner is closed");
+    if (input.command === undefined) {
+      if (Object.keys(launch).length) throw new Error("Background status/kill accepts only background_id and kill");
+      const job = this.jobs.get(id);
+      if (!job) throw new Error(`Unknown background_id: ${id}`);
+      await job.ready;
+      if (kill) { job.kill?.(); await job.done; }
+      return { ...job.result! };
+    }
+    if (kill !== undefined) throw new Error("kill cannot be combined with command");
+    validateBashArguments(launch);
+    if (this.jobs.has(id)) throw new Error(`Duplicate background_id: ${id}`);
+    let ready!: () => void;
+    let failed!: (error: unknown) => void;
+    const job: BackgroundJob = { command: input.command, ready: new Promise<void>((resolve, reject) => { ready = resolve; failed = reject; }), done: Promise.resolve() };
+    this.jobs.set(id, job);
+    // Background ownership belongs to the runner, not the launching tool call.
+    job.done = this.run(root, launch as BashExecArguments, undefined, {
+      started: (result, stop) => { job.result = { background_id: id, ...result }; job.kill = stop; ready(); },
+    }).then((result) => {
+      const outcome = result.outcome;
+      job.result!.exit = outcome.signal === null ? String(outcome.exit_code)
+        : Object.entries(osConstants.signals).find(([, n]) => n === outcome.signal)?.[0] ?? `signal ${outcome.signal}`;
+    }, (error: unknown) => {
+      if (!job.result) { this.jobs.delete(id); failed(error); return; }
+      const outcome = error instanceof BashExecFailure ? error.result?.outcome : undefined;
+      job.result.exit = outcome?.signal != null
+        ? Object.entries(osConstants.signals).find(([, n]) => n === outcome.signal)?.[0] ?? "unknown"
+        : outcome?.exit_code != null ? String(outcome.exit_code) : "unknown";
+      job.result.error = message(error);
+    }).then(() => {
+      job.kill = undefined;
+      if (job.result && !this.closing) completed?.({ ...job.result });
+    }).catch((error) => { console.error("Background completion notification failed:", message(error)); });
+    await job.ready;
+    return { ...job.result! };
+  }
+
+  run(root: string, input: BashExecArguments, signal?: AbortSignal, hooks?: BackgroundHooks): Promise<BashExecResult> {
     if (this.closing) return Promise.reject(new Error("bash_exec runner is closed"));
     const controller = new AbortController();
     const abort = () => controller.abort(signal?.reason);
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) abort();
-    const command = this.runCommand(root, input, controller.signal);
+    const command = this.runCommand(root, input, controller.signal, hooks);
     this.active.set(controller, command);
     return command.finally(() => {
       signal?.removeEventListener("abort", abort);
@@ -206,12 +284,13 @@ export class BashRunner {
     this.closing ??= (async () => {
       for (const controller of this.active.keys()) controller.abort(new Error("extension is shutting down"));
       await Promise.allSettled(this.active.values());
+      await Promise.allSettled([...this.jobs.values()].map((job) => job.done));
       await this.artifacts.close();
     })();
     return this.closing;
   }
 
-  private async runCommand(root: string, input: BashExecArguments, signal?: AbortSignal): Promise<BashExecResult> {
+  private async runCommand(root: string, input: BashExecArguments, signal?: AbortSignal, hooks?: BackgroundHooks): Promise<BashExecResult> {
     const args = validateBashArguments(input);
     signal?.throwIfAborted();
     if (process.platform === "win32") throw new Error("bash_exec requires a POSIX host (Linux/macOS)");
@@ -269,6 +348,15 @@ export class BashRunner {
     const stderr = new Capture(lease.stderrPath, lease.stderr, args.artifactBytes, args.previewBytes);
     const collected = Promise.all([stdout.collect(child.stdout!, stop), stderr.collect(child.stderr!, stop)]);
     const deadline = setTimeout(() => { timedOut = true; stop(); }, args.timeoutSeconds * 1000);
+    child.once("spawn", () => hooks?.started({
+      pid: child.pid!, exit: null, stdout_path: lease.stdoutPath, stderr_path: lease.stderrPath,
+    }, () => {
+      if (exited || terminating) return;
+      cleanupAttempted = true;
+      send("SIGKILL");
+      terminating = Promise.resolve();
+      wakeStop();
+    }));
     try {
       await Promise.race([exit, stopped]);
       clearTimeout(deadline);

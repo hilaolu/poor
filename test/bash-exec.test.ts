@@ -29,8 +29,8 @@ async function waitFile(path: string) {
 
 test("bash_exec schema matches reference fields and wire bounds except session/env_file", () => {
   const schema = JSON.parse(JSON.stringify(bashParameters));
-  assert.deepEqual(Object.keys(schema.properties).sort(), ["command", "cwd", "max_artifact_bytes", "max_preview_bytes", "timeout_seconds"]);
-  assert.deepEqual(schema.required, ["command"]);
+  assert.deepEqual(Object.keys(schema.properties).sort(), ["background_id", "command", "cwd", "kill", "max_artifact_bytes", "max_preview_bytes", "timeout_seconds"]);
+  assert.deepEqual(schema.required ?? [], []);
   assert.equal(schema.additionalProperties, false);
   assert.equal(schema.properties.command["x-maxUtf8Bytes"], 131072);
   assert.equal(schema.properties.timeout_seconds.anyOf[0].maximum, 604800);

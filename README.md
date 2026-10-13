@@ -94,6 +94,8 @@ can still set their own variables explicitly inside the command string.
 | Property | Effective behavior |
 | --- | --- |
 | `command` | Fresh non-interactive Bash command; no profiles/rc files; stdin closed; at most 131072 UTF-8 bytes. |
+| `background_id` | With `command`, launch a named background job; without `command`, inspect it. Runner-scoped, unique even after completion; 1–64 letters/digits/`_`/`.`/`-`, starting with a letter/digit. |
+| `kill` | With `background_id` and no `command`, `true` sends SIGKILL to the owned process group and waits for cleanup. |
 | `cwd` | Default `.`; arbitrary existing host directory. Relative paths use the Pi session workspace; absolute paths, traversal, and symlinks are allowed. |
 | `timeout_seconds` | Default 120 seconds; effective maximum 604800 seconds (7 days); minimum 1. |
 | `max_artifact_bytes` | Default and maximum 67108864 (64 MiB) raw retained bytes **per stream**; minimum 1. |
@@ -157,6 +159,38 @@ Cleanup does not recurse through unknown directories. There is no background
 retention service, aggregate disk quota, or guarantee against host tmp cleanup.
 Interrupted/crashed captures without a completion marker are left alone.
 
+### Named background jobs
+
+```js
+{ command: "npm run dev", background_id: "dev-server", timeout_seconds: 3600 }
+{ background_id: "dev-server" }
+{ background_id: "dev-server", kill: true }
+```
+
+Launch returns after spawn (not application readiness). Launch, status, and kill
+return `{ background_id, pid, exit, stdout_path, stderr_path }`. `exit` is `null`
+until execution/capture cleanup finishes, then a code string (`"0"`, `"1"`) or
+signal name (`"SIGKILL"`). Capture/cleanup failures also include `error`; an
+unavailable final exit is `"unknown"`. Failed launches throw and release the name.
+
+Both log paths exist immediately, even for empty logs. Read them with ordinary
+foreground commands, e.g. `tail -n 50 -- '/path/to/stderr'`. Capture limits still
+apply, and active captures are not expired by retention cleanup. Stdin remains
+closed; launch the command itself, not `command &`.
+
+Completion sends one model-visible Pi steering message with the final result,
+delivered at the next steering boundary while running, or triggering a turn when
+idle. Shutdown suppresses notifications and cleans up jobs.
+Polling does not consume logs; killing an already finished job returns its result.
+Names and status survive until runner teardown, not across Pi restarts. A PID is
+informational; control always uses the name. Background jobs retain the default
+120-second deadline unless overridden; cancelling a returned launch does not stop
+its job. Without `background_id`, foreground behavior is unchanged.
+
+In interactive Pi, a compact widget above the prompt lists each active job as
+`<background_id> · <pid> · <command summary>`. Commands are single-line and
+truncated to fit; completed jobs disappear, and the widget hides when empty.
+
 ### Command status and cancellation
 
 A returned result does **not** imply command success. Check `exit_code`,
@@ -166,7 +200,7 @@ cancellation throw tool errors, with available capture diagnostics.
 
 Each shell owns a POSIX process group. Timeout, cancellation, and extension
 shutdown trigger TERM then KILL cleanup; leftover group members are also
-terminated after the main shell exits. Background services are not supported.
+terminated after the main shell exits. Named background jobs are supported as below.
 Collector cleanup is bounded, and deliberately detached descendants can escape
 the group; failures do not imply rollback of command-side filesystem changes.
 
