@@ -1,7 +1,7 @@
 # poor — workspace-style tools and a complete instruction profile for Pi
 
 A self-contained Pi extension that **shadows and hides `read`, `write`, `edit`,
-and `bash`**. The normal default tool set is **`bash_exec` + `apply_patch`**.
+and `bash`**. The normal default tool set is **`bash_exec` + `apply_patch` + `read_img`**.
 Inspect files and run commands through `bash_exec`; mutate source through
 `apply_patch`. Shell output is collected into separate bounded stdout/stderr
 artifacts, with small inline previews and compact output length counters.
@@ -59,13 +59,36 @@ This repository does not change your global Pi settings automatically.
 For explicit tool allowlists, use the **new names**:
 
 ```bash
-pi -e /home/hilaolu/poor/src/index.ts --tools bash_exec,apply_patch
+pi -e /home/hilaolu/poor/src/index.ts --tools bash_exec,apply_patch,read_img
 pi -e /home/hilaolu/poor/src/index.ts --tools bash_exec
 ```
 
 Pi enforces explicit allowlists. `--tools bash` selects a disabled original
 name and does not authorize `bash_exec`; it therefore leaves no active tool
 in that case. `--no-tools` remains no-tools. Default sessions need no flags.
+
+## read_img
+
+```js
+{ img: "screenshots/page.png", prompt: "Describe the layout and any visible errors." }
+{ img: "https://example.com/image.png", prompt: "What does this image show?" }
+```
+
+Both arguments are required. `img` is a local path relative to the session cwd
+or an absolute path, or an HTTP(S) URL (not base64). URL responses, including
+redirects, are streamed to a private temporary file in the system temp folder
+and removed after reading, failure, or cancellation. No input file-size or
+download-size cap is imposed; available disk/memory and provider limits still
+apply. Pi's native resizing and attachment limits remain in effect.
+The tool uses Pi's native read pipeline for image detection (jpg, png, gif,
+webp, bmp), automatic resizing, attachments,
+and cancellation. Non-images are rejected; use `bash_exec` for text files.
+`prompt` accompanies the attachment for the current model, rather than invoking
+a separate model. Visual inspection requires a vision-capable model; Pi's
+native warning is retained for models without image support.
+Downloads have no tool-level deadline; cancel the call to stop a stalled or
+unending response. As with Pi's native reader, cancellation during image
+processing may leave an already-started resize worker finishing in the background.
 
 ## bash_exec
 

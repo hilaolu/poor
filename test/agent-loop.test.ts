@@ -67,7 +67,7 @@ test("real Pi agent loop supplies the full new prompt and executes both tools wi
   for (const request of requests) {
     assert.match(request.prompt, /Runtime instruction profile: poor\/2/);
     assert.doesNotMatch(request.prompt, /Pi documentation|Use the read tool to load/);
-    assert.deepEqual([...request.tools].sort(), ["apply_patch", "bash_exec"]);
+    assert.deepEqual([...request.tools].sort(), ["apply_patch", "bash_exec", "read_img"]);
   }
   assert.ok(requests[1].results.some((result) => result.includes("provider-smoke") && result.includes("exit_code")));
   assert.equal(await fs.readFile(join(root, "agent-loop.txt"), "utf8"), "created via Pi agent loop\n");

@@ -35,11 +35,11 @@ async function load(t: TestContext, options: Pick<CreateAgentSessionOptions, "to
   return { root, session };
 }
 
-test("real Pi loader activates only bash_exec and apply_patch by default", async (t) => {
+test("real Pi loader activates the three replacement tools by default", async (t) => {
   const { session } = await load(t);
-  assert.deepEqual(session.getActiveToolNames().sort(), ["apply_patch", "bash_exec"]);
+  assert.deepEqual(session.getActiveToolNames().sort(), ["apply_patch", "bash_exec", "read_img"]);
   const registered = session.extensionRunner.getAllRegisteredTools();
-  assert.deepEqual(registered.map((tool) => tool.definition.name).sort(), ["apply_patch", "bash", "bash_exec", "edit", "read", "write"]);
+  assert.deepEqual(registered.map((tool) => tool.definition.name).sort(), ["apply_patch", "bash", "bash_exec", "edit", "read", "read_img", "write"]);
   const definition = session.extensionRunner.getToolDefinition("apply_patch")!;
   assert.match(definition.description, /Match context exactly/);
   assert.match(definition.description, /mixed LF\/CRLF is rejected/);
@@ -67,6 +67,30 @@ test("real Pi loader activates only bash_exec and apply_patch by default", async
   assert.equal(schema.additionalProperties, false);
   assert.equal(schema.properties.patch.minLength, 1);
   assert.equal(schema.properties.patch["x-maxUtf8Bytes"], 33_554_432);
+});
+
+test("Pi-wrapped read_img returns native image attachments and validates inputs", async (t) => {
+  const { root, session } = await load(t);
+  const tool = session.agent.state.tools.find((tool) => tool.name === "read_img")!;
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC", "base64");
+  // Sniff contents, not the extension; paths with spaces must also work.
+  await fs.writeFile(join(root, "image data"), png);
+  for (const img of ["image data", join(root, "image data")]) {
+    const result = await tool.execute("image", { img, prompt: "What is shown?" });
+    assert.deepEqual(result.content[0], { type: "text", text: "What is shown?" });
+    assert.ok(result.content.some((part) => part.type === "image" && part.mimeType === "image/png" && part.data.length > 0));
+    assert.ok(result.content.some((part) => part.type === "text" && part.text.includes("Read image file")));
+  }
+  await fs.writeFile(join(root, "fake.png"), "not an image");
+  await assert.rejects(tool.execute("text", { img: "fake.png", prompt: "inspect" }), /supported image/);
+  await assert.rejects(tool.execute("missing", { img: "missing.png", prompt: "inspect" }), /ENOENT/);
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(tool.execute("abort", { img: "image data", prompt: "inspect" }, controller.signal), /aborted/i);
+  const definition = session.extensionRunner.getToolDefinition("read_img")!;
+  for (const params of [{ img: "image data" }, { img: "", prompt: "x" }, { img: "image data", prompt: "x", extra: true }]) {
+    await assert.rejects(definition.execute("invalid", params, undefined, undefined, session.extensionRunner.createContext()), /accepts exactly/);
+  }
 });
 
 test("Pi-wrapped apply_patch executes in session cwd, not extension install directory", async (t) => {
@@ -135,6 +159,8 @@ test("explicit old-tool allowlists are not bypassed; new-tool-only and no-tools 
   assert.deepEqual(shellOnly.getActiveToolNames(), ["bash_exec"]);
   const { session: patchOnly } = await load(t, { tools: ["apply_patch"] });
   assert.deepEqual(patchOnly.getActiveToolNames(), ["apply_patch"]);
+  const { session: imageOnly } = await load(t, { tools: ["read_img"] });
+  assert.deepEqual(imageOnly.getActiveToolNames(), ["read_img"]);
 });
 
 test("Pi-wrapped bash_exec returns one structured clump and exposes no environment API", async (t) => {

@@ -4,6 +4,7 @@ import { truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { applyPatch, PatchFailure } from "./apply-patch.ts";
 import { LIMITS } from "./patch.ts";
+import { createReadImgTool } from "./read-img.ts";
 import { BASH_SNIPPET, PATCH_SNIPPET, buildPoorSystemPrompt, SHADOWED_TOOLS } from "./prompt.ts";
 import { BashRunner, bashParameters, type BashExecResult, type BackgroundResult } from "./bash-exec.ts";
 
@@ -45,6 +46,7 @@ function commandPreview(command: unknown, limit = 120): string {
 }
 
 export default function poor(pi: ExtensionAPI): void {
+  pi.registerTool(createReadImgTool());
   const shell = new BashRunner();
   let widgetContext: ExtensionContext | undefined;
   const refreshBackgroundWidget = (ctx = widgetContext) => {
@@ -164,6 +166,7 @@ export default function poor(pi: ExtensionAPI): void {
   const hideOriginals = (replaceDefaults = false): void => {
     const active = pi.getActiveTools();
     const next = active.filter((name) => !SHADOWED_TOOLS.has(name));
+    if (replaceDefaults && active.includes("read") && !next.includes("read_img")) next.push("read_img");
     if (replaceDefaults && active.includes("bash") && !next.includes("bash_exec")) next.push("bash_exec");
     if (replaceDefaults && active.some((name) => name === "write" || name === "edit") && !next.includes("apply_patch")) {
       next.push("apply_patch");
